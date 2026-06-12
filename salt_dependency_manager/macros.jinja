@@ -1,0 +1,205 @@
+{#-
+Salt dependency manager helpers.
+
+The public macro is dependency(). It returns a normalized YAML mapping so it can
+be used from pillar, custom states, or this formula's pillar-driven state.
+-#}
+
+{%- set default_path = '/root' %}
+{%- set default_ref = 'master' %}
+{%- set default_env = 'base' %}
+
+{%- macro _as_bool(value, default=True) -%}
+{%- if value is none -%}
+{{ default|yaml }}
+{%- elif value is sameas true or value is sameas false -%}
+{{ value|yaml }}
+{%- elif value|string|lower in ['true', 'yes', 'on', '1'] -%}
+true
+{%- elif value|string|lower in ['false', 'no', 'off', '0'] -%}
+false
+{%- else -%}
+{{ default|yaml }}
+{%- endif -%}
+{%- endmacro %}
+
+{%- macro _repo_name(url) -%}
+{%- set clean_url = url|string|trim|replace('\\', '/') %}
+{%- set clean_url = clean_url[:-1] if clean_url.endswith('/') else clean_url %}
+{{ clean_url.split('/')[-1].replace('.git', '') }}
+{%- endmacro %}
+
+{%- macro _id(value) -%}
+{{ value|string|lower
+  |replace('://', '_')
+  |replace(':', '_')
+  |replace('/', '_')
+  |replace('\\', '_')
+  |replace('.', '_')
+  |replace('-', '_')
+  |replace(' ', '_') }}
+{%- endmacro %}
+
+{%- macro _sides(value) -%}
+{%- if value is string %}
+{%- set result = [value] %}
+{%- elif value is iterable %}
+{%- set result = value %}
+{%- else %}
+{%- set result = ['minion'] %}
+{%- endif %}
+{{ result|yaml }}
+{%- endmacro %}
+
+{%- macro dependency(
+    url,
+    sides='minion',
+    pillar=True,
+    path=default_path,
+    gitfs=False,
+    ref=default_ref,
+    version=None,
+    name=None,
+    env=default_env,
+    root=None,
+    pillar_root='pillar',
+    update=True,
+    options=None
+) -%}
+{%- set dep_name = name or (_repo_name(url)|trim) %}
+{%- set dep_root = root or path.rstrip('/') ~ '/' ~ dep_name %}
+{%- set dep = {
+  'id': _id(url ~ '_' ~ dep_name)|trim,
+  'name': dep_name,
+  'url': url,
+  'sides': _sides(sides)|load_yaml,
+  'pillar': _as_bool(pillar, True)|load_yaml,
+  'path': path,
+  'gitfs': _as_bool(gitfs, False)|load_yaml,
+  'ref': version or ref,
+  'env': env,
+  'root': dep_root,
+  'pillar_root': pillar_root,
+  'update': _as_bool(update, True)|load_yaml,
+  'options': options or {},
+} %}
+{{ dep|yaml }}
+{%- endmacro %}
+
+{%- macro dependency_from_pillar(entry) -%}
+{%- if entry is string %}
+{{ dependency(entry) }}
+{%- elif 'url' in entry %}
+{{ dependency(
+  entry.get('url'),
+  sides=entry.get('sides', entry.get('side', 'minion')),
+  pillar=entry.get('pillar', True),
+  path=entry.get('path', default_path),
+  gitfs=entry.get('gitfs', False),
+  ref=entry.get('ref', entry.get('rev', entry.get('branch', default_ref))),
+  version=entry.get('version'),
+  name=entry.get('name'),
+  env=entry.get('env', default_env),
+  root=entry.get('root'),
+  pillar_root=entry.get('pillar_root', 'pillar'),
+  update=entry.get('update', True),
+  options=entry.get('options', {})
+) }}
+{%- else %}
+{%- set url = entry|first %}
+{%- set opts = entry[url] or {} %}
+{{ dependency(
+  url,
+  sides=opts.get('sides', opts.get('side', 'minion')),
+  pillar=opts.get('pillar', True),
+  path=opts.get('path', default_path),
+  gitfs=opts.get('gitfs', False),
+  ref=opts.get('ref', opts.get('rev', opts.get('branch', default_ref))),
+  version=opts.get('version'),
+  name=opts.get('name'),
+  env=opts.get('env', default_env),
+  root=opts.get('root'),
+  pillar_root=opts.get('pillar_root', 'pillar'),
+  update=opts.get('update', True),
+  options=opts.get('options', {})
+) }}
+{%- endif %}
+{%- endmacro %}
+
+{%- macro config_for_side(side, dependencies) -%}
+# This file is managed by Salt dependency manager.
+{%- if side == 'minion' %}
+file_client: local
+{%- endif %}
+{%- set local_file_roots = {} %}
+{%- set local_pillar_roots = {} %}
+{%- set gitfs_remotes = [] %}
+{%- set git_pillars = [] %}
+{%- for dep in dependencies if side in dep.sides %}
+{%- if dep.gitfs %}
+{%- do gitfs_remotes.append(dep) %}
+{%- if dep.pillar %}
+{%- do git_pillars.append(dep) %}
+{%- endif %}
+{%- else %}
+{%- if dep.env not in local_file_roots %}
+{%- do local_file_roots.update({dep.env: []}) %}
+{%- endif %}
+{%- do local_file_roots[dep.env].append(dep.root) %}
+{%- if dep.pillar %}
+{%- if dep.env not in local_pillar_roots %}
+{%- do local_pillar_roots.update({dep.env: []}) %}
+{%- endif %}
+{%- do local_pillar_roots[dep.env].append(dep.root ~ '/' ~ dep.pillar_root) %}
+{%- endif %}
+{%- endif %}
+{%- endfor %}
+
+{%- if local_file_roots %}
+file_roots:
+{%- for env, roots in local_file_roots|dictsort %}
+  {{ env }}:
+{%- for root in roots %}
+    - {{ root }}
+{%- endfor %}
+{%- endfor %}
+{%- endif %}
+
+{%- if local_pillar_roots %}
+pillar_roots:
+{%- for env, roots in local_pillar_roots|dictsort %}
+  {{ env }}:
+{%- for root in roots %}
+    - {{ root }}
+{%- endfor %}
+{%- endfor %}
+{%- endif %}
+
+{%- if gitfs_remotes %}
+fileserver_backend:
+  - roots
+  - git
+
+gitfs_remotes:
+{%- for dep in gitfs_remotes %}
+  - {{ dep.url }}:
+    - {{ dep.env }}: {{ dep.ref }}
+{%- for key, value in dep.options.items() %}
+    - {{ key }}: {{ value|json }}
+{%- endfor %}
+{%- endfor %}
+{%- endif %}
+
+{%- if git_pillars %}
+ext_pillar:
+  - git:
+{%- for dep in git_pillars %}
+    - {{ dep.ref }} {{ dep.url }}:
+      - env: {{ dep.env }}
+      - root: {{ dep.pillar_root }}
+{%- for key, value in dep.options.items() %}
+      - {{ key }}: {{ value|json }}
+{%- endfor %}
+{%- endfor %}
+{%- endif %}
+{%- endmacro %}
