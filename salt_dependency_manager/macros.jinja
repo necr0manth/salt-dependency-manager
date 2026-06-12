@@ -37,6 +37,7 @@ false
   |replace('\\', '_')
   |replace('.', '_')
   |replace('-', '_')
+  |replace('@', '_')
   |replace(' ', '_') }}
 {%- endmacro %}
 
@@ -201,5 +202,92 @@ ext_pillar:
       - {{ key }}: {{ value|json }}
 {%- endfor %}
 {%- endfor %}
+{%- endif %}
+{%- endmacro %}
+
+{%- macro manage_dependencies(dependencies, config_name=None) -%}
+{%- set config_id = _id(config_name or 'default')|trim %}
+{%- set local_dependencies = dependencies|selectattr('gitfs', 'equalto', False)|list %}
+{%- set configured_sides = [] %}
+{%- for dep in dependencies %}
+{%- for side in dep.sides %}
+{%- if side not in configured_sides %}
+{%- do configured_sides.append(side) %}
+{%- endif %}
+{%- endfor %}
+{%- endfor %}
+
+{%- if not dependencies %}
+salt_dependency_manager_no_dependencies_{{ config_id }}:
+  test.nop:
+    - name: No dependencies were declared for {{ config_name or 'this state' }}.
+{%- else %}
+
+{%- if local_dependencies %}
+salt_dependency_manager_git_{{ config_id }}:
+  pkg.installed:
+    - name: git
+
+{%- set base_paths = [] %}
+{%- for dep in local_dependencies %}
+{%- if dep.path not in base_paths %}
+{%- do base_paths.append(dep.path) %}
+salt_dependency_manager_path_{{ config_id }}_{{ _id(dep.path)|trim }}:
+  file.directory:
+    - name: {{ dep.path }}
+    - makedirs: True
+    - user: root
+    - group: root
+    - require:
+      - pkg: salt_dependency_manager_git_{{ config_id }}
+
+{%- endif %}
+salt_dependency_manager_clone_{{ config_id }}_{{ dep.id }}:
+  git.latest:
+    - name: {{ dep.url }}
+    - target: {{ dep.root }}
+    - rev: {{ dep.ref }}
+{%- if not dep.update %}
+    - unless: test -d {{ dep.root }}/.git
+{%- endif %}
+{%- for key, value in dep.options.items() %}
+    - {{ key }}: {{ value|json }}
+{%- endfor %}
+    - require:
+      - file: salt_dependency_manager_path_{{ config_id }}_{{ _id(dep.path)|trim }}
+
+{%- endfor %}
+{%- endif %}
+
+{%- for side in configured_sides %}
+{%- if side in ['master', 'minion'] %}
+salt_dependency_manager_config_dir_{{ config_id }}_{{ side }}:
+  file.directory:
+    - name: /etc/salt/{{ side }}.d
+    - makedirs: True
+    - user: root
+    - group: root
+
+salt_dependency_manager_config_{{ config_id }}_{{ side }}:
+  file.managed:
+    - name: /etc/salt/{{ side }}.d/salt-dependency-manager{% if config_name %}-{{ config_id }}{% endif %}.conf
+    - mode: '0644'
+    - user: root
+    - group: root
+    - contents: |
+{{ config_for_side(side, dependencies)|indent(8, True) }}
+    - require:
+      - file: salt_dependency_manager_config_dir_{{ config_id }}_{{ side }}
+{%- for dep in local_dependencies if side in dep.sides %}
+      - git: salt_dependency_manager_clone_{{ config_id }}_{{ dep.id }}
+{%- endfor %}
+
+{%- else %}
+salt_dependency_manager_invalid_side_{{ config_id }}_{{ side }}:
+  test.fail_without_changes:
+    - name: "Invalid dependency side '{{ side }}'. Expected 'master' or 'minion'."
+{%- endif %}
+{%- endfor %}
+
 {%- endif %}
 {%- endmacro %}

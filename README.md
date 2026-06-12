@@ -19,7 +19,23 @@ discoverable by `salt-local-bootstrap`:
 salt_dependency_manager
 ```
 
-Declare dependencies in pillar:
+Either declare dependencies in a state with the reusable macro:
+
+```jinja
+{%- from "salt_dependency_manager/macros.jinja" import dependency, manage_dependencies with context %}
+
+{%- set salt_lib = dependency(
+  "git@github.com:necr0manth/salt-lib.git",
+  sides=["minion"],
+  pillar=False,
+  path="/root",
+  ref="main"
+)|load_yaml %}
+
+{{ manage_dependencies([salt_lib], config_name="main") }}
+```
+
+or declare dependencies in pillar and apply `salt_dependency_manager` directly:
 
 ```yaml
 salt_dependency_manager:
@@ -42,23 +58,22 @@ For `gitfs: true`, the state does not clone the repository. It adds the
 dependency to `gitfs_remotes` and, when `pillar` is true, adds it to
 `ext_pillar` using the repository's `pillar` directory.
 
-## Dependency Macro
+## Dependency Macros
 
-Import the macro when you want to build a dependency entry from another Jinja
+Import the macros when you want to build dependency entries from another Jinja
 state or pillar file:
 
 ```jinja
-{%- from "salt_dependency_manager/macros.jinja" import dependency with context %}
-{%- load_yaml as docker_formula %}
-{{ dependency(
+{%- from "salt_dependency_manager/macros.jinja" import dependency, manage_dependencies with context %}
+{%- set docker_formula = dependency(
   "https://github.com/saltstack-formulas/docker-formula.git",
   sides=["minion"],
   pillar=True,
   path="/root",
   gitfs=False,
   ref="master"
-) }}
-{%- endload %}
+)|load_yaml %}
+{{ manage_dependencies([docker_formula], config_name="my_repo") }}
 ```
 
 Arguments:
@@ -76,6 +91,12 @@ Arguments:
 - `update`: for local clones, update an existing checkout. Defaults to `true`.
 - `options`: extra options passed to `git.latest`, `gitfs_remotes`, or
   `git_pillar`.
+
+`manage_dependencies(dependencies, config_name=None)` emits the Salt states
+that install git, clone non-gitfs dependencies, and write Salt config for the
+selected sides. Set `config_name` from the declaring repository or state, such
+as `main`; it namespaces generated Salt IDs and writes a config file such as
+`/etc/salt/minion.d/salt-dependency-manager-main.conf`.
 
 ## Pillar Formats
 
@@ -105,3 +126,21 @@ Salt reads these on later `salt-call --local` or daemon runs.
 Note: Salt warns against placing sensitive pillar data under a path exposed by
 `file_roots`. This manager follows the requested `<repo-root>/pillar` convention;
 avoid storing secrets there unless the repository exposure model is acceptable.
+
+## Transitive Dependencies
+
+Prefer declaring dependencies in a repository-owned state, for example
+`main.dependencies` or `salt-lib.dependencies`, using `dependency()` and
+`manage_dependencies()`. This avoids a shared pillar key where one repository's
+dependency list can overwrite another's.
+
+Salt renders an SLS before states in that SLS clone new repositories, so a
+freshly cloned dependency's own `*.dependencies` state cannot be discovered and
+compiled in the same render pass automatically. The reliable pattern is:
+
+- the root repository's bootstrap state applies its own `<repo>.dependencies`;
+- each dependency that has dependencies declares them in its own
+  `<repo>.dependencies` state;
+- apply the dependency state again after the new repository root is available,
+  or include those dependency states explicitly once they are part of the
+  configured roots.
