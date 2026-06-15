@@ -32,7 +32,12 @@ Either declare dependencies in a state with the reusable macro:
   ref="main"
 )|load_yaml %}
 
-{{ manage_dependencies([salt_lib], config_name="main") }}
+{{ manage_dependencies(
+  [salt_lib],
+  config_name="main",
+  file_roots=["/root/salt-main"],
+  pillar_roots=["/root/salt-main/pillar"]
+) }}
 ```
 
 or declare dependencies in pillar and apply `salt_dependency_manager` directly:
@@ -97,6 +102,13 @@ that install git, clone non-gitfs dependencies, and write Salt config for the
 selected sides. Set `config_name` from the declaring repository or state, such
 as `main`; it namespaces generated Salt IDs and writes a config file such as
 `/etc/salt/minion.d/salt-dependency-manager-main.conf`.
+
+Optional `config_basename`, `file_roots`, and `pillar_roots` arguments let the
+declaring repository own a single combined config file. For example,
+`config_basename="salt-vps1"`, `file_roots=["/root/salt-vps1"]`, and
+`pillar_roots=["/root/salt-vps1/pillar"]` writes
+`/etc/salt/minion.d/salt-vps1.conf` with those local roots first, followed by
+managed dependency roots.
 
 ## Pillar Formats
 

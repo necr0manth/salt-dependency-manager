@@ -127,7 +127,7 @@ false
 {%- endif %}
 {%- endmacro %}
 
-{%- macro config_for_side(side, dependencies) -%}
+{%- macro config_for_side(side, dependencies, file_roots=None, pillar_roots=None) -%}
 # This file is managed by Salt dependency manager.
 {%- if side == 'minion' %}
 file_client: local
@@ -136,6 +136,24 @@ file_client: local
 {%- set local_pillar_roots = {} %}
 {%- set gitfs_remotes = [] %}
 {%- set git_pillars = [] %}
+{%- set extra_file_roots = [file_roots] if file_roots is string else (file_roots or []) %}
+{%- set extra_pillar_roots = [pillar_roots] if pillar_roots is string else (pillar_roots or []) %}
+{%- for root in extra_file_roots %}
+{%- if default_env not in local_file_roots %}
+{%- do local_file_roots.update({default_env: []}) %}
+{%- endif %}
+{%- if root not in local_file_roots[default_env] %}
+{%- do local_file_roots[default_env].append(root) %}
+{%- endif %}
+{%- endfor %}
+{%- for root in extra_pillar_roots %}
+{%- if default_env not in local_pillar_roots %}
+{%- do local_pillar_roots.update({default_env: []}) %}
+{%- endif %}
+{%- if root not in local_pillar_roots[default_env] %}
+{%- do local_pillar_roots[default_env].append(root) %}
+{%- endif %}
+{%- endfor %}
 {%- for dep in dependencies if side in dep.sides %}
 {%- if dep.gitfs %}
 {%- do gitfs_remotes.append(dep) %}
@@ -205,8 +223,15 @@ ext_pillar:
 {%- endif %}
 {%- endmacro %}
 
-{%- macro manage_dependencies(dependencies, config_name=None) -%}
+{%- macro manage_dependencies(
+    dependencies,
+    config_name=None,
+    config_basename=None,
+    file_roots=None,
+    pillar_roots=None
+) -%}
 {%- set config_id = _id(config_name or 'default')|trim %}
+{%- set conf_name = config_basename or 'salt-dependency-manager' ~ ('-' ~ config_id if config_name else '') %}
 {%- set local_dependencies = dependencies|selectattr('gitfs', 'equalto', False)|list %}
 {%- set configured_sides = [] %}
 {%- for dep in dependencies %}
@@ -270,12 +295,12 @@ salt_dependency_manager_config_dir_{{ config_id }}_{{ side }}:
 
 salt_dependency_manager_config_{{ config_id }}_{{ side }}:
   file.managed:
-    - name: /etc/salt/{{ side }}.d/salt-dependency-manager{% if config_name %}-{{ config_id }}{% endif %}.conf
+    - name: /etc/salt/{{ side }}.d/{{ conf_name }}.conf
     - mode: '0644'
     - user: root
     - group: root
     - contents: |
-{{ config_for_side(side, dependencies)|indent(8, True) }}
+{{ config_for_side(side, dependencies, file_roots=file_roots, pillar_roots=pillar_roots)|indent(8, True) }}
     - require:
       - file: salt_dependency_manager_config_dir_{{ config_id }}_{{ side }}
 {%- for dep in local_dependencies if side in dep.sides %}
