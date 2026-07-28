@@ -3,22 +3,22 @@
 ---
 salt_dependency_manager:
   dependencies:
-    # Minimal form. Clones to /root/salt-formula, configures the minion side,
-    # and adds /root/salt-formula to file_roots plus /root/salt-formula/pillar
-    # to pillar_roots.
+    # Minion example. The default dependency side is minion. This clones to
+    # /root/salt-formula and adds its roots to minion config.
     - https://github.com/saltstack-formulas/salt-formula.git
 
-    # Full form.
+    # Master example. sides declares dependency applicability; it does not
+    # select a remote machine.
     - url: https://github.com/saltstack-formulas/openssh-formula.git
       sides:
-        - minion
+        - master
       pillar: true
       path: /root
       gitfs: false
       version: master
 
-    # GitFS form. No local clone is managed. The repo is added to
-    # gitfs_remotes, and pillar=true adds it to ext_pillar with root: pillar.
+    # Both-sides example. This dependency applies to master and minion config
+    # on the current machine. GitFS means no local clone is managed.
     - url: https://github.com/saltstack-formulas/nginx-formula.git
       sides:
         - master
@@ -27,3 +27,6 @@ salt_dependency_manager:
       gitfs: true
       ref: master
       env: base
+
+  # manage_dependencies(..., target_sides=...) is an invocation argument used
+  # by repository-owned Jinja states. It is not a pillar key consumed here.

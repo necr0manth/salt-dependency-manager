@@ -97,11 +97,12 @@ Arguments:
 - `options`: extra options passed to `git.latest`, `gitfs_remotes`, or
   `git_pillar`.
 
-`manage_dependencies(dependencies, config_name=None)` emits the Salt states
-that install git, clone non-gitfs dependencies, and write Salt config for the
-selected sides. Set `config_name` from the declaring repository or state, such
-as `main`; it namespaces generated Salt IDs and writes a config file such as
-`/etc/salt/minion.d/salt-dependency-manager-main.conf`.
+`manage_dependencies(dependencies, config_name=None, config_basename=None,
+file_roots=None, pillar_roots=None, target_sides=None)` emits the Salt states
+that install git, clone applicable non-gitfs dependencies, and write Salt
+config for the requested sides. Set `config_name` from the declaring repository
+or state, such as `main`; it namespaces generated Salt IDs and writes a config
+file such as `/etc/salt/minion.d/salt-dependency-manager-main.conf`.
 
 Optional `config_basename`, `file_roots`, and `pillar_roots` arguments let the
 declaring repository own a single combined config file. For example,
@@ -109,6 +110,53 @@ declaring repository own a single combined config file. For example,
 `pillar_roots=["/root/salt-vps1/pillar"]` writes
 `/etc/salt/minion.d/salt-vps1.conf` with those local roots first, followed by
 managed dependency roots.
+
+### Dependency applicability and invocation targets
+
+`dependency(..., sides=...)` declares where that dependency is applicable.
+`manage_dependencies(..., target_sides=...)` independently selects which Salt
+component configs this particular invocation writes on the current machine.
+It does not select remote machines or perform remote installation.
+
+The three target forms are:
+
+```jinja
+{{ manage_dependencies(dependencies, target_sides=["minion"]) }}
+{{ manage_dependencies(dependencies, target_sides=["master"]) }}
+{{ manage_dependencies(dependencies, target_sides=["minion", "master"]) }}
+```
+
+The first writes only the minion config, the second writes only the master
+config, and the third configures both components on the same machine. A string
+or iterable is accepted; duplicates are ignored in first-seen order. Omitting
+`target_sides` preserves the default behavior: the invocation uses the stable
+union of all declared dependency sides. An explicitly requested side is still
+written when no dependency applies to it, so caller-provided `file_roots` and
+`pillar_roots` can configure that component by themselves.
+
+Only dependencies whose `sides` intersect `target_sides` are active for that
+invocation. Local dependencies are cloned once even when they apply to both
+sides, and git is installed only when an active local dependency needs it.
+Each generated config contains only dependencies applicable to that side.
+Minion config sets `file_client: local`; master config does not.
+
+These states execute locally wherever the Salt command itself runs. A
+masterless minion example is:
+
+```console
+salt-call --local state.apply example.dependencies.masterless
+```
+
+A Salt master orchestration example is:
+
+```console
+salt-run state.orchestrate example.dependencies.master
+```
+
+In both cases, `target_sides` controls local config generation, not command
+targeting. Future Salt processes read the newly configured roots. An already
+running Salt master may need to be restarted before it sees master-side config
+changes; this formula does not restart daemons.
 
 ## Pillar Formats
 
@@ -128,12 +176,13 @@ salt_dependency_manager:
       ref: master
 ```
 
-The generated config files are:
+Depending on the requested or declared sides, generated config paths are:
 
 - `/etc/salt/minion.d/salt-dependency-manager.conf`
 - `/etc/salt/master.d/salt-dependency-manager.conf`
 
-Salt reads these on later `salt-call --local` or daemon runs.
+Salt reads these on later `salt-call --local` or daemon runs. Applying only one
+`target_sides` value neither writes nor removes the other side's config.
 
 Note: Salt warns against placing sensitive pillar data under a path exposed by
 `file_roots`. This manager follows the requested `<repo-root>/pillar` convention;

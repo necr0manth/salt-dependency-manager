@@ -44,10 +44,10 @@ false
 {%- macro _sides(value) -%}
 {%- if value is string %}
 {%- set result = [value] %}
-{%- elif value is iterable %}
-{%- set result = value %}
+{%- elif value is iterable and value is not mapping %}
+{%- set result = value|list %}
 {%- else %}
-{%- set result = ['minion'] %}
+{%- set result = value %}
 {%- endif %}
 {{ result|yaml }}
 {%- endmacro %}
@@ -228,46 +228,145 @@ ext_pillar:
     config_name=None,
     config_basename=None,
     file_roots=None,
-    pillar_roots=None
+    pillar_roots=None,
+    target_sides=None
 ) -%}
 {%- set config_id = _id(config_name or 'default')|trim %}
 {%- set conf_name = config_basename or 'salt-dependency-manager' ~ ('-' ~ config_id if config_name else '') %}
-{%- set local_dependencies = dependencies|selectattr('gitfs', 'equalto', False)|list %}
-{%- set configured_sides = [] %}
+
+{# Validate and normalize every dependency before emitting any state blocks. #}
+{%- if dependencies is string or dependencies is mapping or dependencies is not iterable %}
+{%- do raise('salt-dependency-manager: dependencies must be an iterable of dependency mappings') %}
+{%- endif %}
+{%- set all_dependency_sides = [] %}
 {%- for dep in dependencies %}
-{%- for side in dep.sides %}
-{%- if side not in configured_sides %}
-{%- do configured_sides.append(side) %}
+{%- if dep is not mapping %}
+{%- do raise('salt-dependency-manager: dependency #' ~ loop.index ~ ' must be a mapping') %}
+{%- endif %}
+{%- if 'sides' not in dep %}
+{%- do raise('salt-dependency-manager: dependency #' ~ loop.index ~ ' is missing sides') %}
+{%- endif %}
+{%- set raw_dep_sides = dep.sides %}
+{%- if raw_dep_sides is string %}
+{%- set normalized_dep_sides = [raw_dep_sides] %}
+{%- elif raw_dep_sides is mapping or raw_dep_sides is not iterable %}
+{%- do raise('salt-dependency-manager: dependency #' ~ loop.index ~ ' sides must be a string or iterable') %}
+{%- else %}
+{%- set normalized_dep_sides = raw_dep_sides|list %}
+{%- endif %}
+{%- set unique_dep_sides = [] %}
+{%- for side in normalized_dep_sides %}
+{%- if side is not string or side not in ['minion', 'master'] %}
+{%- do raise("salt-dependency-manager: invalid dependency.sides value '" ~ side|string ~ "'; expected 'minion' or 'master'") %}
+{%- endif %}
+{%- if side not in unique_dep_sides %}
+{%- do unique_dep_sides.append(side) %}
+{%- endif %}
+{%- if side not in all_dependency_sides %}
+{%- do all_dependency_sides.append(side) %}
 {%- endif %}
 {%- endfor %}
+{%- do dep.update({'sides': unique_dep_sides}) %}
 {%- endfor %}
 
-{%- if not dependencies %}
+{# target_sides selects this invocation; dependency.sides remains applicability. #}
+{%- if target_sides is none %}
+{%- set requested_side_values = all_dependency_sides %}
+{%- elif target_sides is string %}
+{%- set requested_side_values = [target_sides] %}
+{%- elif target_sides is mapping or target_sides is not iterable %}
+{%- do raise('salt-dependency-manager: target_sides must be a string or iterable') %}
+{%- else %}
+{%- set requested_side_values = target_sides|list %}
+{%- if not requested_side_values %}
+{%- do raise('salt-dependency-manager: target_sides must not be empty') %}
+{%- endif %}
+{%- endif %}
+{%- set requested_sides = [] %}
+{%- for side in requested_side_values %}
+{%- if side is not string or side not in ['minion', 'master'] %}
+{%- do raise("salt-dependency-manager: invalid target_sides value '" ~ side|string ~ "'; expected 'minion' or 'master'") %}
+{%- endif %}
+{%- if side not in requested_sides %}
+{%- do requested_sides.append(side) %}
+{%- endif %}
+{%- endfor %}
+
+{%- set active_dependencies = [] %}
+{%- for dep in dependencies %}
+{%- if dep not in active_dependencies %}
+{%- for side in dep.sides %}
+{%- if side in requested_sides %}
+{%- do active_dependencies.append(dep) %}
+{%- break %}
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+{%- endfor %}
+{%- set active_local_dependencies = active_dependencies|selectattr('gitfs', 'equalto', False)|list %}
+
+{# Allocate collision-free local state IDs, retaining legacy IDs when unique. #}
+{%- set clone_id_bases = [] %}
+{%- set duplicate_clone_ids = [] %}
+{%- for dep in active_local_dependencies %}
+{%- set clone_id_base = 'salt_dependency_manager_clone_' ~ config_id ~ '_' ~ dep.id %}
+{%- if clone_id_base in clone_id_bases %}
+{%- do duplicate_clone_ids.append(True) %}
+{%- endif %}
+{%- do clone_id_bases.append(clone_id_base) %}
+{%- endfor %}
+{%- set clone_records = [] %}
+{%- for dep in active_local_dependencies %}
+{%- set clone_state_id = clone_id_bases[loop.index0] ~ ('__' ~ loop.index if duplicate_clone_ids else '') %}
+{%- do clone_records.append({'dep': dep, 'state_id': clone_state_id}) %}
+{%- endfor %}
+
+{%- set base_paths = [] %}
+{%- for dep in active_local_dependencies %}
+{%- if dep.path not in base_paths %}
+{%- do base_paths.append(dep.path) %}
+{%- endif %}
+{%- endfor %}
+{%- set path_id_bases = [] %}
+{%- set duplicate_path_ids = [] %}
+{%- for path in base_paths %}
+{%- set path_id_base = 'salt_dependency_manager_path_' ~ config_id ~ '_' ~ (_id(path)|trim) %}
+{%- if path_id_base in path_id_bases %}
+{%- do duplicate_path_ids.append(True) %}
+{%- endif %}
+{%- do path_id_bases.append(path_id_base) %}
+{%- endfor %}
+{%- set path_records = [] %}
+{%- for path in base_paths %}
+{%- set path_state_id = path_id_bases[loop.index0] ~ ('__' ~ loop.index if duplicate_path_ids else '') %}
+{%- do path_records.append({'path': path, 'state_id': path_state_id}) %}
+{%- endfor %}
+
+{%- if not requested_sides %}
 salt_dependency_manager_no_dependencies_{{ config_id }}:
   test.nop:
-    - name: No dependencies were declared for {{ config_name or 'this state' }}.
+    - name: No dependency sides were selected for {{ config_name or 'this state' }}.
 {%- else %}
 
-{%- if local_dependencies %}
+{%- if active_local_dependencies %}
 salt_dependency_manager_git_{{ config_id }}:
   pkg.installed:
     - name: git
 
-{%- set base_paths = [] %}
-{%- for dep in local_dependencies %}
-{%- if dep.path not in base_paths %}
-{%- do base_paths.append(dep.path) %}
-salt_dependency_manager_path_{{ config_id }}_{{ _id(dep.path)|trim }}:
+{%- for record in path_records %}
+{{ record.state_id }}:
   file.directory:
-    - name: {{ dep.path }}
+    - name: {{ record.path }}
     - makedirs: True
     - user: root
     - group: root
     - require:
       - pkg: salt_dependency_manager_git_{{ config_id }}
 
-{%- endif %}
-salt_dependency_manager_clone_{{ config_id }}_{{ dep.id }}:
+{%- endfor %}
+{%- for record in clone_records %}
+{%- set dep = record.dep %}
+{{ record.state_id }}:
   git.latest:
     - name: {{ dep.url }}
     - target: {{ dep.root }}
@@ -279,13 +378,14 @@ salt_dependency_manager_clone_{{ config_id }}_{{ dep.id }}:
     - {{ key }}: {{ value|json }}
 {%- endfor %}
     - require:
-      - file: salt_dependency_manager_path_{{ config_id }}_{{ _id(dep.path)|trim }}
+{%- for path_record in path_records if path_record.path == dep.path %}
+      - file: {{ path_record.state_id }}
+{%- endfor %}
 
 {%- endfor %}
 {%- endif %}
 
-{%- for side in configured_sides %}
-{%- if side in ['master', 'minion'] %}
+{%- for side in requested_sides %}
 salt_dependency_manager_config_dir_{{ config_id }}_{{ side }}:
   file.directory:
     - name: /etc/salt/{{ side }}.d
@@ -300,18 +400,13 @@ salt_dependency_manager_config_{{ config_id }}_{{ side }}:
     - user: root
     - group: root
     - contents: |
-{{ config_for_side(side, dependencies, file_roots=file_roots, pillar_roots=pillar_roots)|indent(8, True) }}
+{{ config_for_side(side, active_dependencies, file_roots=file_roots, pillar_roots=pillar_roots)|indent(8, True) }}
     - require:
       - file: salt_dependency_manager_config_dir_{{ config_id }}_{{ side }}
-{%- for dep in local_dependencies if side in dep.sides %}
-      - git: salt_dependency_manager_clone_{{ config_id }}_{{ dep.id }}
+{%- for record in clone_records if side in record.dep.sides %}
+      - git: {{ record.state_id }}
 {%- endfor %}
 
-{%- else %}
-salt_dependency_manager_invalid_side_{{ config_id }}_{{ side }}:
-  test.fail_without_changes:
-    - name: "Invalid dependency side '{{ side }}'. Expected 'master' or 'minion'."
-{%- endif %}
 {%- endfor %}
 
 {%- endif %}
