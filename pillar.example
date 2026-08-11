@@ -2,31 +2,20 @@
 # vim: ft=yaml
 ---
 salt_dependency_manager:
-  dependencies:
-    # Minion example. The default dependency side is minion. This clones to
-    # /root/salt-formula and adds its roots to minion config.
-    - https://github.com/saltstack-formulas/salt-formula.git
-
-    # Master example. sides declares dependency applicability; it does not
-    # select a remote machine.
-    - url: https://github.com/saltstack-formulas/openssh-formula.git
-      sides:
-        - master
-      pillar: true
-      path: /root
-      gitfs: false
-      version: master
-
-    # Both-sides example. This dependency applies to master and minion config
-    # on the current machine. GitFS means no local clone is managed.
-    - url: https://github.com/saltstack-formulas/nginx-formula.git
-      sides:
-        - master
-        - minion
-      pillar: true
-      gitfs: true
-      ref: master
-      env: base
-
-  # manage_dependencies(..., target_sides=...) is an invocation argument used
-  # by repository-owned Jinja states. It is not a pillar key consumed here.
+  schema: 1
+  saltenv: example
+  sides: [minion]
+  install_path: /root
+  repository_order: [project, salt_lib]
+  repositories:
+    project:
+      source: local
+      path: /root/project
+      state_roots: ['.']
+      pillar_roots: []
+    salt_lib:
+      source: git
+      url: git@github.com:necr0manth/salt-lib.git
+      ref: 547c56d52c756a941d64c22bf98d7d038fcc88ac
+      state_roots: ['.']
+      pillar_roots: []

@@ -1,413 +1,315 @@
-{#-
-Salt dependency manager helpers.
+{#- Schema-1 dependency renderer. The compiled pillar mapping is its only input. #}
 
-The public macro is dependency(). It returns a normalized YAML mapping so it can
-be used from pillar, custom states, or this formula's pillar-driven state.
--#}
+{%- macro render_manager(config) -%}
+{%- if config is not mapping %}
+{%- do raise('salt-dependency-manager: salt_dependency_manager must be a mapping') %}
+{%- endif %}
+{%- if config.get('schema') != 1 %}
+{%- do raise('salt-dependency-manager: schema must be 1') %}
+{%- endif %}
 
-{%- set default_path = '/root' %}
-{%- set default_ref = 'master' %}
-{%- set default_env = 'base' %}
+{%- set saltenv = config.get('saltenv') %}
+{%- if saltenv is not string or not (saltenv|regex_match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')) %}
+{%- do raise('salt-dependency-manager: saltenv must match ^[A-Za-z0-9][A-Za-z0-9_.-]*$') %}
+{%- endif %}
 
-{%- macro _as_bool(value, default=True) -%}
-{%- if value is none -%}
-{{ default|yaml }}
-{%- elif value is sameas true or value is sameas false -%}
-{{ value|yaml }}
-{%- elif value|string|lower in ['true', 'yes', 'on', '1'] -%}
-true
-{%- elif value|string|lower in ['false', 'no', 'off', '0'] -%}
-false
-{%- else -%}
-{{ default|yaml }}
-{%- endif -%}
-{%- endmacro %}
+{%- set sides = config.get('sides') %}
+{%- if sides is string or sides is mapping or sides is not iterable or not sides %}
+{%- do raise('salt-dependency-manager: sides must be a non-empty list') %}
+{%- endif %}
+{%- set normalized_sides = [] %}
+{%- for side in sides %}
+{%- if side is not string or side not in ['minion', 'master'] %}
+{%- do raise("salt-dependency-manager: sides entries must be 'minion' or 'master'") %}
+{%- endif %}
+{%- if side in normalized_sides %}
+{%- do raise('salt-dependency-manager: sides entries must be unique') %}
+{%- endif %}
+{%- do normalized_sides.append(side) %}
+{%- endfor %}
 
-{%- macro _repo_name(url) -%}
-{%- set clean_url = url|string|trim|replace('\\', '/') %}
+{%- set repositories = config.get('repositories') %}
+{%- if repositories is not mapping or not repositories %}
+{%- do raise('salt-dependency-manager: repositories must be a non-empty mapping') %}
+{%- endif %}
+{%- set repository_order = config.get('repository_order') %}
+{%- if repository_order is string or repository_order is mapping or repository_order is not iterable or not repository_order %}
+{%- do raise('salt-dependency-manager: repository_order must be a non-empty list') %}
+{%- endif %}
+{%- set seen_order = [] %}
+{%- for repository_id in repository_order %}
+{%- if repository_id is not string %}
+{%- do raise('salt-dependency-manager: repository_order entries must be strings') %}
+{%- endif %}
+{%- if repository_id in seen_order %}
+{%- do raise('salt-dependency-manager: repository_order entries must be unique') %}
+{%- endif %}
+{%- if repository_id not in repositories %}
+{%- do raise("salt-dependency-manager: repository_order contains unknown repository '" ~ repository_id ~ "'") %}
+{%- endif %}
+{%- do seen_order.append(repository_id) %}
+{%- endfor %}
+{%- if seen_order|length != repositories|length %}
+{%- do raise('salt-dependency-manager: repository_order must contain every repository exactly once') %}
+{%- endif %}
+
+{%- set install_path = config.get('install_path') %}
+{%- if install_path is not none and (install_path is not string or not install_path.startswith('/')) %}
+{%- do raise('salt-dependency-manager: install_path must be an absolute path') %}
+{%- endif %}
+
+{%- set normalized_repositories = [] %}
+{%- set canonical_paths = [] %}
+{%- set file_roots = [] %}
+{%- set pillar_roots = [] %}
+{%- set git_repository_ids = [] %}
+{%- set owned_git_options = ['name', 'target', 'rev', 'update_head', 'require'] %}
+
+{%- for repository_id in repository_order %}
+{%- if not (repository_id|regex_match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')) %}
+{%- do raise("salt-dependency-manager: unsafe repository ID '" ~ repository_id ~ "'") %}
+{%- endif %}
+{%- set repository = repositories.get(repository_id) %}
+{%- if repository is not mapping %}
+{%- do raise("salt-dependency-manager: repository '" ~ repository_id ~ "' must be a mapping") %}
+{%- endif %}
+{%- set source = repository.get('source') %}
+{%- if source not in ['local', 'git'] %}
+{%- do raise("salt-dependency-manager: repository '" ~ repository_id ~ "' source must be local or git") %}
+{%- endif %}
+{%- set ref = repository.get('ref', 'HEAD') %}
+{%- if ref is not string or not ref %}
+{%- do raise("salt-dependency-manager: repository '" ~ repository_id ~ "' ref must be a non-empty string") %}
+{%- endif %}
+{%- set update = repository.get('update', true) %}
+{%- if update is not sameas true and update is not sameas false %}
+{%- do raise("salt-dependency-manager: repository '" ~ repository_id ~ "' update must be boolean") %}
+{%- endif %}
+{%- set git_options = repository.get('git_options', {}) %}
+{%- if git_options is not mapping %}
+{%- do raise("salt-dependency-manager: repository '" ~ repository_id ~ "' git_options must be a mapping") %}
+{%- endif %}
+{%- for option_name in git_options %}
+{%- if option_name is not string or not option_name %}
+{%- do raise("salt-dependency-manager: repository '" ~ repository_id ~ "' git_options keys must be non-empty strings") %}
+{%- endif %}
+{%- if option_name in owned_git_options %}
+{%- do raise("salt-dependency-manager: repository '" ~ repository_id ~ "' git_options may not override manager-owned option '" ~ option_name ~ "'") %}
+{%- endif %}
+{%- endfor %}
+
+{%- if source == 'local' %}
+{%- set repository_path = repository.get('path') %}
+{%- if repository_path is not string or not repository_path.startswith('/') %}
+{%- do raise("salt-dependency-manager: local repository '" ~ repository_id ~ "' requires an absolute path") %}
+{%- endif %}
+{%- if not salt['file.directory_exists'](repository_path) %}
+{%- do raise("salt-dependency-manager: local repository '" ~ repository_id ~ "' path does not exist") %}
+{%- endif %}
+{%- set realpath_result = salt['cmd.run_all'](['realpath', '-e', '--', repository_path], python_shell=false) %}
+{%- if realpath_result.get('retcode') != 0 %}
+{%- do raise("salt-dependency-manager: cannot resolve local repository '" ~ repository_id ~ "' path") %}
+{%- endif %}
+{%- set canonical_repository_path = realpath_result.get('stdout') %}
+{%- set url = none %}
+{%- else %}
+{%- set url = repository.get('url') %}
+{%- if url is not string or not url|trim %}
+{%- do raise("salt-dependency-manager: git repository '" ~ repository_id ~ "' requires a non-empty url") %}
+{%- endif %}
+{%- set repository_path = repository.get('path') %}
+{%- if repository_path is not none %}
+{%- if repository_path is not string or not repository_path.startswith('/') %}
+{%- do raise("salt-dependency-manager: git repository '" ~ repository_id ~ "' path must be absolute") %}
+{%- endif %}
+{%- else %}
+{%- if install_path is not string or not install_path.startswith('/') %}
+{%- do raise("salt-dependency-manager: git repository '" ~ repository_id ~ "' requires an absolute install_path") %}
+{%- endif %}
+{%- set clean_url = url|trim %}
 {%- set clean_url = clean_url[:-1] if clean_url.endswith('/') else clean_url %}
-{{ clean_url.split('/')[-1].replace('.git', '') }}
-{%- endmacro %}
-
-{%- macro _id(value) -%}
-{{ value|string|lower
-  |replace('://', '_')
-  |replace(':', '_')
-  |replace('/', '_')
-  |replace('\\', '_')
-  |replace('.', '_')
-  |replace('-', '_')
-  |replace('@', '_')
-  |replace(' ', '_') }}
-{%- endmacro %}
-
-{%- macro _sides(value) -%}
-{%- if value is string %}
-{%- set result = [value] %}
-{%- elif value is iterable and value is not mapping %}
-{%- set result = value|list %}
-{%- else %}
-{%- set result = value %}
+{%- set repository_name = clean_url.split('/')[-1] %}
+{%- set repository_name = repository_name[:-4] if repository_name.endswith('.git') else repository_name %}
+{%- if not repository_name or not (repository_name|regex_match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')) %}
+{%- do raise("salt-dependency-manager: git repository '" ~ repository_id ~ "' URL has an unsafe repository basename") %}
 {%- endif %}
-{{ result|yaml }}
-{%- endmacro %}
+{%- set repository_path = install_path.rstrip('/') ~ '/' ~ repository_name %}
+{%- endif %}
+{%- set realpath_result = salt['cmd.run_all'](['realpath', '-m', '--', repository_path], python_shell=false) %}
+{%- if realpath_result.get('retcode') != 0 %}
+{%- do raise("salt-dependency-manager: cannot resolve git repository '" ~ repository_id ~ "' target") %}
+{%- endif %}
+{%- set canonical_repository_path = realpath_result.get('stdout') %}
+{%- do git_repository_ids.append(repository_id) %}
+{%- endif %}
 
-{%- macro dependency(
-    url,
-    sides='minion',
-    pillar=True,
-    path=default_path,
-    gitfs=False,
-    ref=default_ref,
-    version=None,
-    name=None,
-    env=default_env,
-    root=None,
-    pillar_root='pillar',
-    update=True,
-    options=None
-) -%}
-{%- set dep_name = name or (_repo_name(url)|trim) %}
-{%- set dep_root = root or path.rstrip('/') ~ '/' ~ dep_name %}
-{%- set dep = {
-  'id': _id(url ~ '_' ~ dep_name)|trim,
-  'name': dep_name,
+{%- if canonical_repository_path in canonical_paths %}
+{%- do raise("salt-dependency-manager: canonical repository path collision at '" ~ canonical_repository_path ~ "'") %}
+{%- endif %}
+{%- do canonical_paths.append(canonical_repository_path) %}
+
+{%- set normalized_state_roots = [] %}
+{%- set normalized_pillar_roots = [] %}
+{%- for root_kind, declared_roots, output_roots in [
+  ('state_roots', repository.get('state_roots', ['.']), normalized_state_roots),
+  ('pillar_roots', repository.get('pillar_roots', ['pillar']), normalized_pillar_roots)
+] %}
+{%- if declared_roots is string or declared_roots is mapping or declared_roots is not iterable %}
+{%- do raise("salt-dependency-manager: repository '" ~ repository_id ~ "' " ~ root_kind ~ ' must be a list') %}
+{%- endif %}
+{%- for declared_root in declared_roots %}
+{%- if declared_root is not string or not declared_root %}
+{%- do raise("salt-dependency-manager: repository '" ~ repository_id ~ "' " ~ root_kind ~ ' entries must be non-empty strings') %}
+{%- endif %}
+{%- if declared_root.startswith('/') or '..' in declared_root.split('/') %}
+{%- do raise("salt-dependency-manager: repository '" ~ repository_id ~ "' " ~ root_kind ~ " entries must be relative and may not contain '..'") %}
+{%- endif %}
+{%- set normalized_root = salt['file.normpath'](declared_root) %}
+{%- if normalized_root.startswith('/') or normalized_root == '..' or normalized_root.startswith('../') %}
+{%- do raise("salt-dependency-manager: repository '" ~ repository_id ~ "' " ~ root_kind ~ ' entry escapes the repository') %}
+{%- endif %}
+{%- set normalized_root = '.' if normalized_root == '.' else normalized_root %}
+{%- do output_roots.append(normalized_root) %}
+{%- set absolute_root = canonical_repository_path if normalized_root == '.' else canonical_repository_path.rstrip('/') ~ '/' ~ normalized_root %}
+{%- if source == 'local' %}
+{%- if not salt['file.directory_exists'](absolute_root) %}
+{%- do raise("salt-dependency-manager: local repository '" ~ repository_id ~ "' declared root does not exist: " ~ normalized_root) %}
+{%- endif %}
+{%- set root_realpath_result = salt['cmd.run_all'](['realpath', '-e', '--', absolute_root], python_shell=false) %}
+{%- if root_realpath_result.get('retcode') != 0 %}
+{%- do raise("salt-dependency-manager: cannot resolve local repository '" ~ repository_id ~ "' root: " ~ normalized_root) %}
+{%- endif %}
+{%- set canonical_root = root_realpath_result.get('stdout') %}
+{%- if canonical_root != canonical_repository_path and not canonical_root.startswith(canonical_repository_path.rstrip('/') ~ '/') %}
+{%- do raise("salt-dependency-manager: local repository '" ~ repository_id ~ "' root escapes through a symlink: " ~ normalized_root) %}
+{%- endif %}
+{%- endif %}
+{%- if root_kind == 'state_roots' and absolute_root not in file_roots %}
+{%- do file_roots.append(absolute_root) %}
+{%- elif root_kind == 'pillar_roots' and absolute_root not in pillar_roots %}
+{%- do pillar_roots.append(absolute_root) %}
+{%- endif %}
+{%- endfor %}
+{%- endfor %}
+{%- do normalized_repositories.append({
+  'id': repository_id,
+  'source': source,
+  'path': repository_path,
+  'canonical_path': canonical_repository_path,
   'url': url,
-  'sides': _sides(sides)|load_yaml,
-  'pillar': _as_bool(pillar, True)|load_yaml,
-  'path': path,
-  'gitfs': _as_bool(gitfs, False)|load_yaml,
-  'ref': version or ref,
-  'env': env,
-  'root': dep_root,
-  'pillar_root': pillar_root,
-  'update': _as_bool(update, True)|load_yaml,
-  'options': options or {},
-} %}
-{{ dep|yaml }}
-{%- endmacro %}
-
-{%- macro dependency_from_pillar(entry) -%}
-{%- if entry is string %}
-{{ dependency(entry) }}
-{%- elif 'url' in entry %}
-{{ dependency(
-  entry.get('url'),
-  sides=entry.get('sides', entry.get('side', 'minion')),
-  pillar=entry.get('pillar', True),
-  path=entry.get('path', default_path),
-  gitfs=entry.get('gitfs', False),
-  ref=entry.get('ref', entry.get('rev', entry.get('branch', default_ref))),
-  version=entry.get('version'),
-  name=entry.get('name'),
-  env=entry.get('env', default_env),
-  root=entry.get('root'),
-  pillar_root=entry.get('pillar_root', 'pillar'),
-  update=entry.get('update', True),
-  options=entry.get('options', {})
-) }}
-{%- else %}
-{%- set url = entry|first %}
-{%- set opts = entry[url] or {} %}
-{{ dependency(
-  url,
-  sides=opts.get('sides', opts.get('side', 'minion')),
-  pillar=opts.get('pillar', True),
-  path=opts.get('path', default_path),
-  gitfs=opts.get('gitfs', False),
-  ref=opts.get('ref', opts.get('rev', opts.get('branch', default_ref))),
-  version=opts.get('version'),
-  name=opts.get('name'),
-  env=opts.get('env', default_env),
-  root=opts.get('root'),
-  pillar_root=opts.get('pillar_root', 'pillar'),
-  update=opts.get('update', True),
-  options=opts.get('options', {})
-) }}
-{%- endif %}
-{%- endmacro %}
-
-{%- macro config_for_side(side, dependencies, file_roots=None, pillar_roots=None) -%}
-# This file is managed by Salt dependency manager.
-{%- if side == 'minion' %}
-file_client: local
-{%- endif %}
-{%- set local_file_roots = {} %}
-{%- set local_pillar_roots = {} %}
-{%- set gitfs_remotes = [] %}
-{%- set git_pillars = [] %}
-{%- set extra_file_roots = [file_roots] if file_roots is string else (file_roots or []) %}
-{%- set extra_pillar_roots = [pillar_roots] if pillar_roots is string else (pillar_roots or []) %}
-{%- for root in extra_file_roots %}
-{%- if default_env not in local_file_roots %}
-{%- do local_file_roots.update({default_env: []}) %}
-{%- endif %}
-{%- if root not in local_file_roots[default_env] %}
-{%- do local_file_roots[default_env].append(root) %}
-{%- endif %}
-{%- endfor %}
-{%- for root in extra_pillar_roots %}
-{%- if default_env not in local_pillar_roots %}
-{%- do local_pillar_roots.update({default_env: []}) %}
-{%- endif %}
-{%- if root not in local_pillar_roots[default_env] %}
-{%- do local_pillar_roots[default_env].append(root) %}
-{%- endif %}
-{%- endfor %}
-{%- for dep in dependencies if side in dep.sides %}
-{%- if dep.gitfs %}
-{%- do gitfs_remotes.append(dep) %}
-{%- if dep.pillar %}
-{%- do git_pillars.append(dep) %}
-{%- endif %}
-{%- else %}
-{%- if dep.env not in local_file_roots %}
-{%- do local_file_roots.update({dep.env: []}) %}
-{%- endif %}
-{%- do local_file_roots[dep.env].append(dep.root) %}
-{%- if dep.pillar %}
-{%- if dep.env not in local_pillar_roots %}
-{%- do local_pillar_roots.update({dep.env: []}) %}
-{%- endif %}
-{%- do local_pillar_roots[dep.env].append(dep.root ~ '/' ~ dep.pillar_root) %}
-{%- endif %}
-{%- endif %}
+  'ref': ref,
+  'update': update,
+  'git_options': git_options,
+  'state_roots': normalized_state_roots,
+  'pillar_roots': normalized_pillar_roots
+}) %}
 {%- endfor %}
 
-{%- if local_file_roots %}
-file_roots:
-{%- for env, roots in local_file_roots|dictsort %}
-  {{ env }}:
-{%- for root in roots %}
-    - {{ root }}
-{%- endfor %}
-{%- endfor %}
-{%- endif %}
-
-{%- if local_pillar_roots %}
-pillar_roots:
-{%- for env, roots in local_pillar_roots|dictsort %}
-  {{ env }}:
-{%- for root in roots %}
-    - {{ root }}
-{%- endfor %}
-{%- endfor %}
-{%- endif %}
-
-{%- if gitfs_remotes %}
-fileserver_backend:
-  - roots
-  - git
-
-gitfs_remotes:
-{%- for dep in gitfs_remotes %}
-  - {{ dep.url }}:
-    - {{ dep.env }}: {{ dep.ref }}
-{%- for key, value in dep.options.items() %}
-    - {{ key }}: {{ value|json }}
-{%- endfor %}
-{%- endfor %}
-{%- endif %}
-
-{%- if git_pillars %}
-ext_pillar:
-  - git:
-{%- for dep in git_pillars %}
-    - {{ dep.ref }} {{ dep.url }}:
-      - env: {{ dep.env }}
-      - root: {{ dep.pillar_root }}
-{%- for key, value in dep.options.items() %}
-      - {{ key }}: {{ value|json }}
-{%- endfor %}
-{%- endfor %}
-{%- endif %}
-{%- endmacro %}
-
-{%- macro manage_dependencies(
-    dependencies,
-    config_name=None,
-    config_basename=None,
-    file_roots=None,
-    pillar_roots=None,
-    target_sides=None
-) -%}
-{%- set config_id = _id(config_name or 'default')|trim %}
-{%- set conf_name = config_basename or 'salt-dependency-manager' ~ ('-' ~ config_id if config_name else '') %}
-
-{# Validate and normalize every dependency before emitting any state blocks. #}
-{%- if dependencies is string or dependencies is mapping or dependencies is not iterable %}
-{%- do raise('salt-dependency-manager: dependencies must be an iterable of dependency mappings') %}
-{%- endif %}
-{%- set all_dependency_sides = [] %}
-{%- for dep in dependencies %}
-{%- if dep is not mapping %}
-{%- do raise('salt-dependency-manager: dependency #' ~ loop.index ~ ' must be a mapping') %}
-{%- endif %}
-{%- if 'sides' not in dep %}
-{%- do raise('salt-dependency-manager: dependency #' ~ loop.index ~ ' is missing sides') %}
-{%- endif %}
-{%- set raw_dep_sides = dep.sides %}
-{%- if raw_dep_sides is string %}
-{%- set normalized_dep_sides = [raw_dep_sides] %}
-{%- elif raw_dep_sides is mapping or raw_dep_sides is not iterable %}
-{%- do raise('salt-dependency-manager: dependency #' ~ loop.index ~ ' sides must be a string or iterable') %}
-{%- else %}
-{%- set normalized_dep_sides = raw_dep_sides|list %}
-{%- endif %}
-{%- set unique_dep_sides = [] %}
-{%- for side in normalized_dep_sides %}
-{%- if side is not string or side not in ['minion', 'master'] %}
-{%- do raise("salt-dependency-manager: invalid dependency.sides value '" ~ side|string ~ "'; expected 'minion' or 'master'") %}
-{%- endif %}
-{%- if side not in unique_dep_sides %}
-{%- do unique_dep_sides.append(side) %}
-{%- endif %}
-{%- if side not in all_dependency_sides %}
-{%- do all_dependency_sides.append(side) %}
-{%- endif %}
-{%- endfor %}
-{%- do dep.update({'sides': unique_dep_sides}) %}
-{%- endfor %}
-
-{# target_sides selects this invocation; dependency.sides remains applicability. #}
-{%- if target_sides is none %}
-{%- set requested_side_values = all_dependency_sides %}
-{%- elif target_sides is string %}
-{%- set requested_side_values = [target_sides] %}
-{%- elif target_sides is mapping or target_sides is not iterable %}
-{%- do raise('salt-dependency-manager: target_sides must be a string or iterable') %}
-{%- else %}
-{%- set requested_side_values = target_sides|list %}
-{%- if not requested_side_values %}
-{%- do raise('salt-dependency-manager: target_sides must not be empty') %}
-{%- endif %}
-{%- endif %}
-{%- set requested_sides = [] %}
-{%- for side in requested_side_values %}
-{%- if side is not string or side not in ['minion', 'master'] %}
-{%- do raise("salt-dependency-manager: invalid target_sides value '" ~ side|string ~ "'; expected 'minion' or 'master'") %}
-{%- endif %}
-{%- if side not in requested_sides %}
-{%- do requested_sides.append(side) %}
-{%- endif %}
-{%- endfor %}
-
-{%- set active_dependencies = [] %}
-{%- for dep in dependencies %}
-{%- if dep not in active_dependencies %}
-{%- for side in dep.sides %}
-{%- if side in requested_sides %}
-{%- do active_dependencies.append(dep) %}
-{%- break %}
-{%- endif %}
-{%- endfor %}
-{%- endif %}
-{%- endfor %}
-{%- set active_local_dependencies = active_dependencies|selectattr('gitfs', 'equalto', False)|list %}
-
-{# Allocate collision-free local state IDs, retaining legacy IDs when unique. #}
-{%- set clone_id_bases = [] %}
-{%- set duplicate_clone_ids = [] %}
-{%- for dep in active_local_dependencies %}
-{%- set clone_id_base = 'salt_dependency_manager_clone_' ~ config_id ~ '_' ~ dep.id %}
-{%- if clone_id_base in clone_id_bases %}
-{%- do duplicate_clone_ids.append(True) %}
-{%- endif %}
-{%- do clone_id_bases.append(clone_id_base) %}
-{%- endfor %}
-{%- set clone_records = [] %}
-{%- for dep in active_local_dependencies %}
-{%- set clone_state_id = clone_id_bases[loop.index0] ~ ('__' ~ loop.index if duplicate_clone_ids else '') %}
-{%- do clone_records.append({'dep': dep, 'state_id': clone_state_id}) %}
-{%- endfor %}
-
-{%- set base_paths = [] %}
-{%- for dep in active_local_dependencies %}
-{%- if dep.path not in base_paths %}
-{%- do base_paths.append(dep.path) %}
-{%- endif %}
-{%- endfor %}
-{%- set path_id_bases = [] %}
-{%- set duplicate_path_ids = [] %}
-{%- for path in base_paths %}
-{%- set path_id_base = 'salt_dependency_manager_path_' ~ config_id ~ '_' ~ (_id(path)|trim) %}
-{%- if path_id_base in path_id_bases %}
-{%- do duplicate_path_ids.append(True) %}
-{%- endif %}
-{%- do path_id_bases.append(path_id_base) %}
-{%- endfor %}
-{%- set path_records = [] %}
-{%- for path in base_paths %}
-{%- set path_state_id = path_id_bases[loop.index0] ~ ('__' ~ loop.index if duplicate_path_ids else '') %}
-{%- do path_records.append({'path': path, 'state_id': path_state_id}) %}
-{%- endfor %}
-
-{%- if not requested_sides %}
-salt_dependency_manager_no_dependencies_{{ config_id }}:
-  test.nop:
-    - name: No dependency sides were selected for {{ config_name or 'this state' }}.
-{%- else %}
-
-{%- if active_local_dependencies %}
-salt_dependency_manager_git_{{ config_id }}:
+{%- if git_repository_ids %}
+salt_dependency_manager_git:
   pkg.installed:
     - name: git
 
-{%- for record in path_records %}
-{{ record.state_id }}:
-  file.directory:
-    - name: {{ record.path }}
-    - makedirs: True
-    - user: root
-    - group: root
-    - require:
-      - pkg: salt_dependency_manager_git_{{ config_id }}
-
-{%- endfor %}
-{%- for record in clone_records %}
-{%- set dep = record.dep %}
-{{ record.state_id }}:
+{%- endif %}
+{%- for repository in normalized_repositories if repository.source == 'git' %}
+salt_dependency_manager_repository_{{ repository.id }}:
   git.latest:
-    - name: {{ dep.url }}
-    - target: {{ dep.root }}
-    - rev: {{ dep.ref }}
-{%- if not dep.update %}
-    - unless: test -d {{ dep.root }}/.git
-{%- endif %}
-{%- for key, value in dep.options.items() %}
-    - {{ key }}: {{ value|json }}
+    - name: {{ repository.url|json }}
+    - target: {{ repository.path|json }}
+    - rev: {{ repository.ref|json }}
+    - update_head: {{ repository['update']|yaml }}
+{%- for option_name, option_value in repository.git_options.items() %}
+    - {{ option_name|json }}: {{ option_value|json }}
 {%- endfor %}
     - require:
-{%- for path_record in path_records if path_record.path == dep.path %}
-      - file: {{ path_record.state_id }}
-{%- endfor %}
+      - pkg: salt_dependency_manager_git
+
+{%- for root_kind, roots in [('state', repository.state_roots), ('pillar', repository.pillar_roots)] %}
+{%- for root in roots %}
+salt_dependency_manager_{{ repository.id }}_{{ root_kind }}_root_{{ loop.index }}:
+  cmd.run:
+    - name:
+      - python3
+      - -c
+      - |
+          import os
+          import sys
+          repository = os.path.realpath(sys.argv[1])
+          root = os.path.realpath(os.path.join(repository, sys.argv[2]))
+          valid = os.path.isdir(root) and (root == repository or root.startswith(repository + os.sep))
+          raise SystemExit(0 if valid else 1)
+      - {{ repository.path|json }}
+      - {{ root|json }}
+    - python_shell: false
+    - require:
+      - git: salt_dependency_manager_repository_{{ repository.id }}
 
 {%- endfor %}
-{%- endif %}
+{%- endfor %}
+{%- endfor %}
 
-{%- for side in requested_sides %}
-salt_dependency_manager_config_dir_{{ config_id }}_{{ side }}:
+{%- for side in ['minion', 'master'] %}
+{%- set config_path = '/etc/salt/' ~ side ~ '.d/50-salt-dependency-manager-' ~ saltenv ~ '.conf' %}
+{%- if side in normalized_sides %}
+salt_dependency_manager_{{ side }}_config_directory:
   file.directory:
-    - name: /etc/salt/{{ side }}.d
-    - makedirs: True
-    - user: root
-    - group: root
-
-salt_dependency_manager_config_{{ config_id }}_{{ side }}:
-  file.managed:
-    - name: /etc/salt/{{ side }}.d/{{ conf_name }}.conf
-    - mode: '0644'
-    - user: root
-    - group: root
-    - contents: |
-{{ config_for_side(side, active_dependencies, file_roots=file_roots, pillar_roots=pillar_roots)|indent(8, True) }}
+    - name: {{ ('/etc/salt/' ~ side ~ '.d')|json }}
+    - makedirs: true
+{%- if git_repository_ids %}
     - require:
-      - file: salt_dependency_manager_config_dir_{{ config_id }}_{{ side }}
-{%- for record in clone_records if side in record.dep.sides %}
-      - git: {{ record.state_id }}
+      - pkg: salt_dependency_manager_git
+{%- for repository in normalized_repositories if repository.source == 'git' %}
+      - git: salt_dependency_manager_repository_{{ repository.id }}
+{%- for root_kind, roots in [('state', repository.state_roots), ('pillar', repository.pillar_roots)] %}
+{%- for root in roots %}
+      - cmd: salt_dependency_manager_{{ repository.id }}_{{ root_kind }}_root_{{ loop.index }}
 {%- endfor %}
+{%- endfor %}
+{%- endfor %}
+{%- endif %}
 
+salt_dependency_manager_{{ side }}_config:
+  file.managed:
+    - name: {{ config_path|json }}
+    - contents: |
+        # This file is managed by Salt dependency manager.
+        file_roots:
+          {{ saltenv|json }}:
+{%- if file_roots %}
+{%- for root in file_roots %}
+            - {{ root|json }}
 {%- endfor %}
+{%- else %}
+            []
+{%- endif %}
+        pillar_roots:
+          {{ saltenv|json }}:
+{%- if pillar_roots %}
+{%- for root in pillar_roots %}
+            - {{ root|json }}
+{%- endfor %}
+{%- else %}
+            []
+{%- endif %}
+    - require:
+      - file: salt_dependency_manager_{{ side }}_config_directory
+{%- if git_repository_ids %}
+      - pkg: salt_dependency_manager_git
+{%- for repository in normalized_repositories if repository.source == 'git' %}
+      - git: salt_dependency_manager_repository_{{ repository.id }}
+{%- for root_kind, roots in [('state', repository.state_roots), ('pillar', repository.pillar_roots)] %}
+{%- for root in roots %}
+      - cmd: salt_dependency_manager_{{ repository.id }}_{{ root_kind }}_root_{{ loop.index }}
+{%- endfor %}
+{%- endfor %}
+{%- endfor %}
+{%- endif %}
+
+{%- else %}
+salt_dependency_manager_{{ side }}_config_absent:
+  file.absent:
+    - name: {{ config_path|json }}
 
 {%- endif %}
+{%- endfor %}
 {%- endmacro %}
