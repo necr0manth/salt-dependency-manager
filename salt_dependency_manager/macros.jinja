@@ -256,8 +256,8 @@ salt_dependency_manager_{{ repository.id }}_{{ root_kind }}_root_{{ loop.index }
     - name: >-
         python3 -c
         {{ "import base64,json,os,sys; decode=lambda value: base64.b64decode(value).decode('utf-8'); repository=os.path.realpath(decode(sys.argv[1])); root=os.path.realpath(os.path.join(repository,decode(sys.argv[2]))); valid=os.path.isdir(root) and (root == repository or root.startswith(repository + os.sep)); print(json.dumps({'changed': False, 'comment': 'repository root verified' if valid else 'repository root invalid'})); raise SystemExit(0 if valid else 1)"|json }}
-        {{ salt['hashutil.base64_encodestring'](repository.path)|trim|json }}
-        {{ salt['hashutil.base64_encodestring'](root)|trim|json }}
+        {{ salt['hashutil.base64_b64encode'](repository.path)|json }}
+        {{ salt['hashutil.base64_b64encode'](root)|json }}
     - stateful: true
     - require:
       - git: salt_dependency_manager_repository_{{ repository.id }}
