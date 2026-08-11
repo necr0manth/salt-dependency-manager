@@ -42,10 +42,12 @@ Repositories default to `ref: HEAD`, `state_roots: ['.']`,
 may be empty. Roots must be relative, must exist after materialization, and may
 not escape the repository lexically or through symlinks.
 
-`git_options` is passed to `git.latest`, except for manager-owned `name`,
-`target`, `rev`, `update_head`, and `require`. Deployment policy may impose
-additional restrictions on otherwise supported options such as `force_clone`,
-`force_checkout`, or `force_reset`.
+`git_options` accepts only Salt 3008 `git.latest` options: `branch`, `user`,
+`password`, `force_checkout`, `force_clone`, `force_fetch`, `force_reset`,
+`submodules`, `bare`, `mirror`, `remote`, `fetch_tags`, `sync_tags`, `depth`,
+`identity`, `https_user`, `https_pass`, `refspec_branch`, `refspec_tag`, and
+`output_encoding`. Manager-owned `name`, `target`, `rev`, `update_head`, and
+`require`, state requisites, global options, and unknown keys are rejected.
 
 ## Ownership and execution
 

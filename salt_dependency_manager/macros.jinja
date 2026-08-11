@@ -4,7 +4,7 @@
 {%- if config is not mapping %}
 {%- do raise('salt-dependency-manager: salt_dependency_manager must be a mapping') %}
 {%- endif %}
-{%- if config.get('schema') != 1 %}
+{%- if config.get('schema') is not integer or config.get('schema') != 1 %}
 {%- do raise('salt-dependency-manager: schema must be 1') %}
 {%- endif %}
 
@@ -14,7 +14,7 @@
 {%- endif %}
 
 {%- set sides = config.get('sides') %}
-{%- if sides is string or sides is mapping or sides is not iterable or not sides %}
+{%- if sides is string or sides is mapping or sides is not sequence or not sides %}
 {%- do raise('salt-dependency-manager: sides must be a non-empty list') %}
 {%- endif %}
 {%- set normalized_sides = [] %}
@@ -33,7 +33,7 @@
 {%- do raise('salt-dependency-manager: repositories must be a non-empty mapping') %}
 {%- endif %}
 {%- set repository_order = config.get('repository_order') %}
-{%- if repository_order is string or repository_order is mapping or repository_order is not iterable or not repository_order %}
+{%- if repository_order is string or repository_order is mapping or repository_order is not sequence or not repository_order %}
 {%- do raise('salt-dependency-manager: repository_order must be a non-empty list') %}
 {%- endif %}
 {%- set seen_order = [] %}
@@ -64,6 +64,28 @@
 {%- set pillar_roots = [] %}
 {%- set git_repository_ids = [] %}
 {%- set owned_git_options = ['name', 'target', 'rev', 'update_head', 'require'] %}
+{%- set allowed_git_options = [
+  'branch',
+  'user',
+  'password',
+  'force_checkout',
+  'force_clone',
+  'force_fetch',
+  'force_reset',
+  'submodules',
+  'bare',
+  'mirror',
+  'remote',
+  'fetch_tags',
+  'sync_tags',
+  'depth',
+  'identity',
+  'https_user',
+  'https_pass',
+  'refspec_branch',
+  'refspec_tag',
+  'output_encoding'
+] %}
 
 {%- for repository_id in repository_order %}
 {%- if not (repository_id|regex_match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')) %}
@@ -95,6 +117,9 @@
 {%- endif %}
 {%- if option_name in owned_git_options %}
 {%- do raise("salt-dependency-manager: repository '" ~ repository_id ~ "' git_options may not override manager-owned option '" ~ option_name ~ "'") %}
+{%- endif %}
+{%- if option_name not in allowed_git_options %}
+{%- do raise("salt-dependency-manager: repository '" ~ repository_id ~ "' unsupported git_options key '" ~ option_name ~ "'") %}
 {%- endif %}
 {%- endfor %}
 
@@ -154,7 +179,7 @@
   ('state_roots', repository.get('state_roots', ['.']), normalized_state_roots),
   ('pillar_roots', repository.get('pillar_roots', ['pillar']), normalized_pillar_roots)
 ] %}
-{%- if declared_roots is string or declared_roots is mapping or declared_roots is not iterable %}
+{%- if declared_roots is string or declared_roots is mapping or declared_roots is not sequence %}
 {%- do raise("salt-dependency-manager: repository '" ~ repository_id ~ "' " ~ root_kind ~ ' must be a list') %}
 {%- endif %}
 {%- for declared_root in declared_roots %}
@@ -227,21 +252,13 @@ salt_dependency_manager_repository_{{ repository.id }}:
 {%- for root_kind, roots in [('state', repository.state_roots), ('pillar', repository.pillar_roots)] %}
 {%- for root in roots %}
 salt_dependency_manager_{{ repository.id }}_{{ root_kind }}_root_{{ loop.index }}:
-  module.run:
-    - cmd.run_all:
-      - cmd:
-        - python3
-        - -c
-        - |
-            import os
-            import sys
-            repository = os.path.realpath(sys.argv[1])
-            root = os.path.realpath(os.path.join(repository, sys.argv[2]))
-            valid = os.path.isdir(root) and (root == repository or root.startswith(repository + os.sep))
-            raise SystemExit(0 if valid else 1)
-        - {{ repository.path|json }}
-        - {{ root|json }}
-      - python_shell: false
+  cmd.run:
+    - name: >-
+        python3 -c
+        {{ "import base64,json,os,sys; decode=lambda value: base64.b64decode(value).decode('utf-8'); repository=os.path.realpath(decode(sys.argv[1])); root=os.path.realpath(os.path.join(repository,decode(sys.argv[2]))); valid=os.path.isdir(root) and (root == repository or root.startswith(repository + os.sep)); print(json.dumps({'changed': False, 'comment': 'repository root verified' if valid else 'repository root invalid'})); raise SystemExit(0 if valid else 1)"|json }}
+        {{ salt['hashutil.base64_encodestring'](repository.path)|trim|json }}
+        {{ salt['hashutil.base64_encodestring'](root)|trim|json }}
+    - stateful: true
     - require:
       - git: salt_dependency_manager_repository_{{ repository.id }}
 
@@ -263,7 +280,7 @@ salt_dependency_manager_{{ side }}_config_directory:
       - git: salt_dependency_manager_repository_{{ repository.id }}
 {%- for root_kind, roots in [('state', repository.state_roots), ('pillar', repository.pillar_roots)] %}
 {%- for root in roots %}
-      - module: salt_dependency_manager_{{ repository.id }}_{{ root_kind }}_root_{{ loop.index }}
+      - cmd: salt_dependency_manager_{{ repository.id }}_{{ root_kind }}_root_{{ loop.index }}
 {%- endfor %}
 {%- endfor %}
 {%- endfor %}
@@ -273,7 +290,8 @@ salt_dependency_manager_{{ side }}_config:
   file.managed:
     - name: {{ config_path|json }}
     - contents: |
-        # This file is managed by Salt dependency manager.
+        # Managed by salt-dependency-manager.
+
         file_roots:
           {{ saltenv|json }}:
 {%- if file_roots %}
@@ -300,7 +318,7 @@ salt_dependency_manager_{{ side }}_config:
       - git: salt_dependency_manager_repository_{{ repository.id }}
 {%- for root_kind, roots in [('state', repository.state_roots), ('pillar', repository.pillar_roots)] %}
 {%- for root in roots %}
-      - module: salt_dependency_manager_{{ repository.id }}_{{ root_kind }}_root_{{ loop.index }}
+      - cmd: salt_dependency_manager_{{ repository.id }}_{{ root_kind }}_root_{{ loop.index }}
 {%- endfor %}
 {%- endfor %}
 {%- endfor %}
