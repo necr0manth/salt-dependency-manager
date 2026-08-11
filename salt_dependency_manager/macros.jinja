@@ -227,20 +227,21 @@ salt_dependency_manager_repository_{{ repository.id }}:
 {%- for root_kind, roots in [('state', repository.state_roots), ('pillar', repository.pillar_roots)] %}
 {%- for root in roots %}
 salt_dependency_manager_{{ repository.id }}_{{ root_kind }}_root_{{ loop.index }}:
-  cmd.run:
-    - name:
-      - python3
-      - -c
-      - |
-          import os
-          import sys
-          repository = os.path.realpath(sys.argv[1])
-          root = os.path.realpath(os.path.join(repository, sys.argv[2]))
-          valid = os.path.isdir(root) and (root == repository or root.startswith(repository + os.sep))
-          raise SystemExit(0 if valid else 1)
-      - {{ repository.path|json }}
-      - {{ root|json }}
-    - python_shell: false
+  module.run:
+    - cmd.run_all:
+      - cmd:
+        - python3
+        - -c
+        - |
+            import os
+            import sys
+            repository = os.path.realpath(sys.argv[1])
+            root = os.path.realpath(os.path.join(repository, sys.argv[2]))
+            valid = os.path.isdir(root) and (root == repository or root.startswith(repository + os.sep))
+            raise SystemExit(0 if valid else 1)
+        - {{ repository.path|json }}
+        - {{ root|json }}
+      - python_shell: false
     - require:
       - git: salt_dependency_manager_repository_{{ repository.id }}
 
@@ -262,7 +263,7 @@ salt_dependency_manager_{{ side }}_config_directory:
       - git: salt_dependency_manager_repository_{{ repository.id }}
 {%- for root_kind, roots in [('state', repository.state_roots), ('pillar', repository.pillar_roots)] %}
 {%- for root in roots %}
-      - cmd: salt_dependency_manager_{{ repository.id }}_{{ root_kind }}_root_{{ loop.index }}
+      - module: salt_dependency_manager_{{ repository.id }}_{{ root_kind }}_root_{{ loop.index }}
 {%- endfor %}
 {%- endfor %}
 {%- endfor %}
@@ -299,7 +300,7 @@ salt_dependency_manager_{{ side }}_config:
       - git: salt_dependency_manager_repository_{{ repository.id }}
 {%- for root_kind, roots in [('state', repository.state_roots), ('pillar', repository.pillar_roots)] %}
 {%- for root in roots %}
-      - cmd: salt_dependency_manager_{{ repository.id }}_{{ root_kind }}_root_{{ loop.index }}
+      - module: salt_dependency_manager_{{ repository.id }}_{{ root_kind }}_root_{{ loop.index }}
 {%- endfor %}
 {%- endfor %}
 {%- endfor %}
